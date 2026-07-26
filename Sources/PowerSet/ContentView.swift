@@ -1,0 +1,702 @@
+import SwiftUI
+
+struct ContentView: View {
+    enum Tab: String, CaseIterable, Identifiable {
+        case schedule = "Schedule"
+        case settings = "Settings"
+        case status = "Status"
+
+        var id: String { rawValue }
+
+        var systemImage: String {
+            switch self {
+            case .schedule: return "calendar.badge.clock"
+            case .settings: return "slider.horizontal.3"
+            case .status: return "info.circle"
+            }
+        }
+    }
+
+    @State private var tab: Tab = .schedule
+
+    // Schedule
+    @State private var eventType: PmsetService.EventType = .restart
+    @State private var selectedDays: Set<PmsetService.Weekday> = [.sunday]
+    @State private var eventTime: Date = Self.defaultEventTime()
+    @State private var scheduleStatusText = ""
+
+    // Settings
+    @State private var powerScope: PmsetService.PowerScope = .all
+    @State private var settings = PmsetService.PowerSettings()
+
+    // Shared status line
+    @State private var statusMessage: String?
+    @State private var statusIsError = false
+    @State private var isBusy = false
+    @State private var sessionAuthorized = false
+    @State private var liveStatusText = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 10)
+
+            Divider()
+
+            Picker("Section", selection: $tab) {
+                ForEach(Tab.allCases) { t in
+                    Label(t.rawValue, systemImage: t.systemImage).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .accessibilityLabel("Section")
+
+            Group {
+                switch tab {
+                case .schedule:
+                    schedulePane
+                case .settings:
+                    settingsPane
+                case .status:
+                    statusPane
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            Divider()
+
+            footer
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+        }
+        .frame(minWidth: 480, minHeight: 560)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear { refreshAll() }
+        .onReceive(NotificationCenter.default.publisher(for: .powerSetAuthorizationDidChange)) { _ in
+            sessionAuthorized = PrivilegedSession.shared.isAuthorized
+            if !sessionAuthorized {
+                setStatus("Administrator authorization cleared for this session.", error: false)
+            }
+        }
+        .onChange(of: tab) { newTab in
+            if newTab == .status || newTab == .schedule {
+                refreshScheduleAndLive()
+            }
+        }
+    }
+
+    // MARK: - Defaults
+
+    /// Today at 05:00 local — reliable for DatePicker + pmset time formatting.
+    private static func defaultEventTime() -> Date {
+        Calendar.current.date(bySettingHour: 5, minute: 0, second: 0, of: Date()) ?? Date()
+    }
+
+    // MARK: - Header
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "bolt.circle.fill")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(.orange)
+                    .symbolRenderingMode(.hierarchical)
+                    .accessibilityHidden(true)
+                Text("PowerSet")
+                    .font(.headline)
+                Spacer(minLength: 0)
+                authBadge
+            }
+
+            Text("GUI for sudo pmset — schedule repeating power events and edit sleep timers.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var authBadge: some View {
+        Text(sessionAuthorized ? "Admin ready" : "Admin when needed")
+            .font(.caption.weight(.medium))
+            .foregroundStyle(sessionAuthorized ? Color.green : Color.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                Capsule().fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .accessibilityLabel(
+                sessionAuthorized
+                    ? "Administrator authorization ready"
+                    : "Administrator authorization will be requested when needed"
+            )
+            .help(
+                sessionAuthorized
+                    ? "Administrator rights cached for this app session. PowerSet → Forget Authorization to clear."
+                    : "macOS will ask for your password when you apply changes."
+            )
+    }
+
+    // MARK: - Schedule
+
+    private var schedulePane: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 14) {
+                        LabeledContent("Event") {
+                            Picker("Event type", selection: $eventType) {
+                                ForEach(PmsetService.EventType.allCases) { t in
+                                    Text(t.label).tag(t)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 200, alignment: .trailing)
+                        }
+
+                        LabeledContent("Time") {
+                            DatePicker(
+                                "Time",
+                                selection: $eventTime,
+                                displayedComponents: .hourAndMinute
+                            )
+                            .labelsHidden()
+                            .frame(maxWidth: 140, alignment: .trailing)
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Weekdays")
+                                .font(.subheadline.weight(.medium))
+                            weekdayPicker
+                            HStack(spacing: 8) {
+                                Button("Weekdays") {
+                                    selectedDays = [.monday, .tuesday, .wednesday, .thursday, .friday]
+                                }
+                                .controlSize(.small)
+                                .disabled(isBusy)
+                                Button("Every day") {
+                                    selectedDays = Set(PmsetService.Weekday.allCases)
+                                }
+                                .controlSize(.small)
+                                .disabled(isBusy)
+                                Button("Clear") {
+                                    selectedDays = []
+                                }
+                                .controlSize(.small)
+                                .disabled(isBusy)
+                            }
+                        }
+
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Command preview")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Text(repeatCommandPreview)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .foregroundStyle(selectedDays.isEmpty ? .secondary : .primary)
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(Color(nsColor: .textBackgroundColor))
+                                )
+                                .accessibilityLabel("Command preview: \(repeatCommandPreview)")
+                        }
+
+                        HStack(spacing: 10) {
+                            Button {
+                                applyRepeat()
+                            } label: {
+                                Label("Apply Schedule", systemImage: "checkmark.circle.fill")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.orange)
+                            .disabled(isBusy || selectedDays.isEmpty)
+                            .keyboardShortcut(.defaultAction)
+                            .help("Runs the previewed sudo pmset repeat command")
+
+                            Button(role: .destructive) {
+                                cancelRepeat()
+                            } label: {
+                                Label("Cancel Schedule", systemImage: "xmark.circle")
+                            }
+                            .disabled(isBusy)
+                            .help("Runs sudo pmset repeat cancel")
+                        }
+                    }
+                    .padding(4)
+                } label: {
+                    Label("Repeating power event", systemImage: "arrow.clockwise")
+                        .font(.subheadline.weight(.semibold))
+                }
+
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Current schedule")
+                                .font(.subheadline.weight(.medium))
+                            Spacer()
+                            Button {
+                                refreshScheduleAndLive()
+                                setStatus("Schedule refreshed.", error: false)
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Refresh schedule")
+                            .disabled(isBusy)
+                            .accessibilityLabel("Refresh schedule")
+                        }
+
+                        Text(scheduleStatusText.isEmpty ? "No schedule info." : scheduleStatusText)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(Color(nsColor: .textBackgroundColor))
+                            )
+                    }
+                    .padding(4)
+                } label: {
+                    Label("pmset -g sched", systemImage: "list.bullet.rectangle")
+                        .font(.subheadline.weight(.semibold))
+                }
+
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("How testing works")
+                            .font(.subheadline.weight(.medium))
+                        Text(
+                            """
+                            Set Restart to a time a few minutes ahead, apply, and stay awake and logged in. When it fires, macOS shows its own restart notice — often with a “try again later” / postpone option of about 10 minutes. That dialog means the schedule worked.
+                            """
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                        Text("The ~10 minute postpone is fixed system behavior")
+                            .font(.caption.weight(.semibold))
+                        Text(
+                            """
+                            PowerSet and pmset cannot change that timer. There is no System Settings or defaults control for it. It exists so you can save work before a scheduled restart. For a different warning style, you would need another mechanism (for example a LaunchDaemon running shutdown), not this schedule.
+                            """
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                        Text("A scheduled restart may not fire if the Mac is asleep, at the login window, or blocked by unsaved documents. Verify anytime with Current schedule above (or pmset -g sched — no trailing period).")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(4)
+                } label: {
+                    Label("Testing & the restart dialog", systemImage: "questionmark.circle")
+                        .font(.subheadline.weight(.semibold))
+                }
+
+                Text("Note: macOS allows one repeating power-on style event and one power-off style event. Applying a new schedule replaces the previous matching type.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+        }
+    }
+
+    private var weekdayPicker: some View {
+        HStack(spacing: 6) {
+            ForEach(PmsetService.Weekday.allCases) { day in
+                let on = selectedDays.contains(day)
+                Button {
+                    if on {
+                        selectedDays.remove(day)
+                    } else {
+                        selectedDays.insert(day)
+                    }
+                } label: {
+                    Text(day.shortLabel)
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(on ? Color.orange.opacity(0.85) : Color(nsColor: .controlBackgroundColor))
+                        )
+                        .foregroundStyle(on ? Color.white : Color.primary)
+                }
+                .buttonStyle(.plain)
+                .disabled(isBusy)
+                .help(day.accessibilityLabel)
+                .accessibilityLabel(day.accessibilityLabel)
+                .accessibilityAddTraits(on ? .isSelected : [])
+                .accessibilityValue(on ? "Selected" : "Not selected")
+            }
+        }
+    }
+
+    private var repeatCommandPreview: String {
+        if let args = PmsetService.repeatArguments(type: eventType, weekdays: selectedDays, time: eventTime) {
+            return PmsetService.commandPreview(arguments: args)
+        }
+        return "sudo pmset repeat …  (select at least one weekday)"
+    }
+
+    // MARK: - Settings
+
+    private var settingsPane: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 14) {
+                        LabeledContent("Apply to") {
+                            Picker("Power scope", selection: $powerScope) {
+                                ForEach(PmsetService.PowerScope.allCases) { s in
+                                    Text(s.label).tag(s)
+                                }
+                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 220, alignment: .trailing)
+                            .disabled(isBusy)
+                        }
+
+                        timerRow(
+                            title: "Display sleep",
+                            help: "Minutes until the display sleeps. 0 = never.",
+                            value: $settings.displaysleep
+                        )
+                        timerRow(
+                            title: "System sleep",
+                            help: "Minutes until the Mac sleeps. 0 = never.",
+                            value: $settings.sleep
+                        )
+                        timerRow(
+                            title: "Disk sleep",
+                            help: "Minutes until disks spin down. 0 = never.",
+                            value: $settings.disksleep
+                        )
+
+                        Divider()
+
+                        Toggle("Wake for network access (womp)", isOn: $settings.womp)
+                            .disabled(isBusy)
+                        Toggle("Power Nap", isOn: $settings.powernap)
+                            .disabled(isBusy)
+                        Toggle("Auto-restart after power loss", isOn: $settings.autorestart)
+                            .disabled(isBusy)
+                        Toggle("Keep awake for active TTYs", isOn: $settings.ttyskeepawake)
+                            .disabled(isBusy)
+                        Toggle("Proximity wake", isOn: $settings.proximitywake)
+                            .disabled(isBusy)
+                        Toggle("TCP keepalive during sleep", isOn: $settings.tcpkeepalive)
+                            .disabled(isBusy)
+
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Command preview")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Text(settingsCommandPreview)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(Color(nsColor: .textBackgroundColor))
+                                )
+                                .accessibilityLabel("Command preview: \(settingsCommandPreview)")
+                        }
+
+                        HStack(spacing: 10) {
+                            Button {
+                                applySettings()
+                            } label: {
+                                Label("Apply Settings", systemImage: "checkmark.circle.fill")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.orange)
+                            .disabled(isBusy)
+                            .help("Applies the previewed pmset settings as administrator")
+
+                            Button {
+                                settings = PmsetService.parseLiveSettings()
+                                setStatus("Reloaded current settings from pmset -g.", error: false)
+                            } label: {
+                                Label("Reload", systemImage: "arrow.clockwise")
+                            }
+                            .disabled(isBusy)
+                            .help("Re-read live values from pmset -g into the form")
+                        }
+                    }
+                    .padding(4)
+                } label: {
+                    Label("Sleep timers & options", systemImage: "moon.zzz")
+                        .font(.subheadline.weight(.semibold))
+                }
+
+                GroupBox {
+                    HStack(spacing: 10) {
+                        Button {
+                            runQuick { PmsetService.displaySleepNow() }
+                        } label: {
+                            Label("Sleep Display Now", systemImage: "display")
+                        }
+                        .disabled(isBusy)
+                        .help("pmset displaysleepnow")
+
+                        Button {
+                            runQuick { PmsetService.sleepNow() }
+                        } label: {
+                            Label("Sleep Mac Now", systemImage: "moon.fill")
+                        }
+                        .disabled(isBusy)
+                        .help("pmset sleepnow")
+                    }
+                    .padding(4)
+                } label: {
+                    Label("Immediate actions", systemImage: "bolt")
+                        .font(.subheadline.weight(.semibold))
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+        }
+    }
+
+    private func timerRow(title: String, help: String, value: Binding<Int>) -> some View {
+        HStack {
+            Text(title)
+                .help(help)
+            Spacer()
+            Stepper(value: value, in: 0...180, step: 1) {
+                Text(value.wrappedValue == 0 ? "Never" : "\(value.wrappedValue) min")
+                    .font(.body.monospacedDigit())
+                    .frame(minWidth: 72, alignment: .trailing)
+            }
+            .frame(maxWidth: 200)
+            .disabled(isBusy)
+            .help(help)
+            .accessibilityLabel(title)
+            .accessibilityValue(value.wrappedValue == 0 ? "Never" : "\(value.wrappedValue) minutes")
+        }
+    }
+
+    private var settingsCommandPreview: String {
+        PmsetService.commandPreview(
+            arguments: PmsetService.settingsArguments(settings, scope: powerScope)
+        )
+    }
+
+    // MARK: - Status
+
+    private var statusPane: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Live power settings")
+                                .font(.subheadline.weight(.medium))
+                            Spacer()
+                            Button {
+                                refreshScheduleAndLive()
+                                setStatus("Status refreshed.", error: false)
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(isBusy)
+                            .accessibilityLabel("Refresh live power settings")
+                        }
+                        Text(liveStatusText.isEmpty ? "—" : liveStatusText)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(Color(nsColor: .textBackgroundColor))
+                            )
+                    }
+                    .padding(4)
+                } label: {
+                    // SF Symbol available on macOS 13+ (avoid macOS 14-only gauge variants).
+                    Label("pmset -g", systemImage: "gauge")
+                        .font(.subheadline.weight(.semibold))
+                }
+
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Current schedule")
+                                .font(.subheadline.weight(.medium))
+                            Spacer()
+                            Button {
+                                refreshScheduleAndLive()
+                                setStatus("Status refreshed.", error: false)
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(isBusy)
+                            .accessibilityLabel("Refresh schedule status")
+                        }
+                        Text(scheduleStatusText.isEmpty ? "—" : scheduleStatusText)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(Color(nsColor: .textBackgroundColor))
+                            )
+                    }
+                    .padding(4)
+                } label: {
+                    Label("pmset -g sched", systemImage: "calendar")
+                        .font(.subheadline.weight(.semibold))
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+        }
+    }
+
+    // MARK: - Footer
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            if isBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Working")
+            }
+            if let statusMessage {
+                Image(systemName: statusIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                    .foregroundStyle(statusIsError ? Color.orange : Color.green)
+                    .imageScale(.small)
+                    .accessibilityHidden(true)
+                Text(statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(statusIsError ? Color.primary : Color.secondary)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+                    .accessibilityLabel(statusIsError ? "Error: \(statusMessage)" : statusMessage)
+            } else {
+                Text("Changes require administrator approval via the macOS password dialog.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(minHeight: 20)
+    }
+
+    // MARK: - Actions
+
+    private func applyRepeat() {
+        guard !isBusy else { return }
+        guard !selectedDays.isEmpty else {
+            setStatus("Select at least one weekday.", error: true)
+            return
+        }
+
+        isBusy = true
+        statusMessage = nil
+        let type = eventType
+        let days = selectedDays
+        let time = eventTime
+
+        // Next run-loop turn so the busy state paints before the auth dialog.
+        DispatchQueue.main.async {
+            let result = PmsetService.applyRepeat(type: type, weekdays: days, time: time)
+            self.handle(result, successFallback: "Schedule applied.")
+            self.sessionAuthorized = PrivilegedSession.shared.isAuthorized
+            self.refreshScheduleAndLive()
+            self.isBusy = false
+        }
+    }
+
+    private func cancelRepeat() {
+        guard !isBusy else { return }
+        isBusy = true
+        statusMessage = nil
+        DispatchQueue.main.async {
+            let result = PmsetService.cancelRepeat()
+            self.handle(result, successFallback: "Repeating schedule cancelled.")
+            self.sessionAuthorized = PrivilegedSession.shared.isAuthorized
+            self.refreshScheduleAndLive()
+            self.isBusy = false
+        }
+    }
+
+    private func applySettings() {
+        guard !isBusy else { return }
+        isBusy = true
+        statusMessage = nil
+        let s = settings
+        let scope = powerScope
+        DispatchQueue.main.async {
+            let result = PmsetService.applySettings(s, scope: scope)
+            self.handle(result, successFallback: "Power settings applied.")
+            self.sessionAuthorized = PrivilegedSession.shared.isAuthorized
+            self.refreshScheduleAndLive()
+            // Re-read live values so the form matches what the system accepted.
+            self.settings = PmsetService.parseLiveSettings()
+            self.isBusy = false
+        }
+    }
+
+    private func runQuick(_ action: @escaping () -> PmsetService.ActionResult) {
+        guard !isBusy else { return }
+        isBusy = true
+        DispatchQueue.main.async {
+            self.handle(action(), successFallback: "Done.")
+            self.isBusy = false
+        }
+    }
+
+    private func handle(_ result: PmsetService.ActionResult, successFallback: String) {
+        switch result {
+        case .success(let output):
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            setStatus(trimmed.isEmpty ? successFallback : trimmed, error: false)
+        case .cancelled:
+            setStatus("Cancelled — no changes made.", error: true)
+        case .failed(let message):
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            setStatus(trimmed.isEmpty ? "Operation failed." : trimmed, error: true)
+        }
+    }
+
+    private func setStatus(_ message: String, error: Bool) {
+        statusMessage = message
+        statusIsError = error
+    }
+
+    private func refreshAll() {
+        sessionAuthorized = PrivilegedSession.shared.isAuthorized
+        settings = PmsetService.parseLiveSettings()
+        refreshScheduleAndLive()
+    }
+
+    private func refreshScheduleAndLive() {
+        scheduleStatusText = PmsetService.scheduleStatus()
+        liveStatusText = PmsetService.liveStatus()
+    }
+}
