@@ -38,6 +38,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
+        true
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
             showMainWindow()
@@ -154,8 +158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAbout(_ sender: Any?) {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "1.0.0"
-        let build = info?["CFBundleVersion"] as? String ?? "1"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "1.0.5"
+        let build = info?["CFBundleVersion"] as? String ?? "6"
         var options: [NSApplication.AboutPanelOptionKey: Any] = [
             .applicationName: "PowerSet",
             .version: version,
@@ -165,8 +169,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Simple GUI for macOS pmset power management.
 
                 Schedule repeating restart/shutdown/wake events \
-                and edit common sleep timers. Uses the system admin \
-                dialog (password is never stored).
+                and edit sleep timers per power source (All / AC / \
+                Battery). Uses the system admin dialog \
+                (password is never stored).
 
                 When a scheduled restart fires while logged in, macOS \
                 may offer to postpone (~10 minutes). That timer is \

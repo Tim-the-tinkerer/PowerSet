@@ -4,6 +4,19 @@ import Foundation
 enum PmsetService {
     static let pmsetPath = "/usr/bin/pmset"
 
+    /// Keys PowerSet can edit in the Settings tab.
+    static let managedSettingKeys: [String] = [
+        "displaysleep",
+        "sleep",
+        "disksleep",
+        "womp",
+        "powernap",
+        "autorestart",
+        "ttyskeepawake",
+        "proximitywake",
+        "tcpkeepalive",
+    ]
+
     // MARK: - Models
 
     enum EventType: String, CaseIterable, Identifiable {
@@ -79,6 +92,40 @@ enum PmsetService {
             case .charger: return "AC Power only"
             }
         }
+
+        /// Header prefix in `pmset -g custom` / capabilities (e.g. "AC Power").
+        var customSectionTitle: String? {
+            switch self {
+            case .all: return nil
+            case .battery: return "Battery Power"
+            case .charger: return "AC Power"
+            }
+        }
+    }
+
+    /// Result of loading settings for a scope (which profile was used).
+    struct SettingsLoad: Equatable {
+        var settings: PowerSettings
+        /// Human-readable source, e.g. "Battery Power (pmset -g custom)".
+        var sourceDescription: String
+        /// Non-nil when the preferred profile was missing and a fallback was used.
+        var warning: String?
+        /// What `pmset -g cap` says this scope can change.
+        var capabilities: SettingCapabilities
+    }
+
+    /// Managed keys a scope can change, from `pmset -g cap`.
+    ///
+    /// `known == false` means the report could not be read, so callers should try every key.
+    /// `known == true` with an empty `keys` means the report was read and this scope supports
+    /// none of them — Battery on a desktop is the usual case.
+    struct SettingCapabilities: Equatable {
+        var known: Bool
+        var keys: Set<String>
+
+        func allows(_ key: String) -> Bool {
+            !known || keys.contains(key)
+        }
     }
 
     struct PowerSettings: Equatable {
@@ -129,9 +176,88 @@ enum PmsetService {
         return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Best-effort parse of live settings into editable fields.
-    static func parseLiveSettings() -> PowerSettings {
-        let text = liveStatus()
+    /// Feature capabilities dump (`pmset -g cap`).
+    static func capabilitiesStatus() -> String {
+        let result = runUnprivileged(arguments: ["-g", "cap"])
+        return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Keys this Mac reports as supported for the given scope (from `pmset -g cap`).
+    static func settingCapabilities(for scope: PowerScope) -> SettingCapabilities {
+        settingCapabilities(for: scope, reported: capabilitiesBySource())
+    }
+
+    /// Pure form of ``settingCapabilities(for:)``. An empty report is unknown.
+    /// A report that has other sources but no Battery Power section is a known empty battery scope.
+    static func settingCapabilities(
+        for scope: PowerScope,
+        reported caps: [String: Set<String>]
+    ) -> SettingCapabilities {
+        guard !caps.isEmpty else {
+            return SettingCapabilities(known: false, keys: [])
+        }
+        let managed = Set(managedSettingKeys)
+        let sourceKeys: Set<String>
+        switch scope {
+        case .charger:
+            sourceKeys = caps["AC Power"] ?? caps.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        case .battery:
+            sourceKeys = caps["Battery Power"] ?? []
+        case .all:
+            // Union of known sources so All only offers keys at least one profile supports.
+            var union = Set<String>()
+            for value in caps.values {
+                union.formUnion(value)
+            }
+            sourceKeys = union
+        }
+        return SettingCapabilities(known: true, keys: sourceKeys.intersection(managed))
+    }
+
+    /// Parse `pmset -g cap` into source title → set of capability key names.
+    static func capabilitiesBySource() -> [String: Set<String>] {
+        let text = capabilitiesStatus()
+        var result: [String: Set<String>] = [:]
+        var current: String?
+        var keys = Set<String>()
+
+        func flush() {
+            guard let current else { return }
+            result[current] = keys
+            keys = []
+        }
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
+
+            // "Capabilities for AC Power:" or "Capabilities for Battery Power:"
+            if trimmed.lowercased().hasPrefix("capabilities for "),
+               trimmed.hasSuffix(":")
+            {
+                flush()
+                var title = String(trimmed.dropFirst("Capabilities for ".count))
+                if title.hasSuffix(":") {
+                    title = String(title.dropLast())
+                }
+                current = title.trimmingCharacters(in: .whitespaces)
+                continue
+            }
+
+            // Capability lines are single tokens (optionally indented).
+            if current != nil,
+               !trimmed.contains(" "),
+               trimmed.rangeOfCharacter(from: .letters) != nil
+            {
+                keys.insert(trimmed)
+            }
+        }
+        flush()
+        return result
+    }
+
+    /// Parse key/value lines into editable fields (shared by live and custom sections).
+    static func parseSettings(from text: String) -> PowerSettings {
         var s = PowerSettings()
         s.displaysleep = intValue(for: "displaysleep", in: text) ?? s.displaysleep
         s.sleep = intValue(for: "sleep", in: text) ?? s.sleep
@@ -145,9 +271,125 @@ enum PmsetService {
         return s
     }
 
+    /// Currently active configuration (`pmset -g`). Prefer ``parseSettings(for:)`` for the Settings tab.
+    static func parseLiveSettings() -> PowerSettings {
+        parseSettings(from: liveStatus())
+    }
+
+    /// Load form values for the selected power scope.
+    static func parseSettings(for scope: PowerScope) -> SettingsLoad {
+        let custom = customStatus()
+        let sections = customSections(in: custom)
+        let capabilities = settingCapabilities(for: scope)
+
+        switch scope {
+        case .charger:
+            if let body = sections["AC Power"], !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return SettingsLoad(
+                    settings: parseSettings(from: body),
+                    sourceDescription: "AC Power (pmset -g custom)",
+                    warning: nil,
+                    capabilities: capabilities
+                )
+            }
+            return SettingsLoad(
+                settings: parseLiveSettings(),
+                sourceDescription: "Currently in use (pmset -g)",
+                warning: "No AC Power section in pmset -g custom; loaded active values instead.",
+                capabilities: capabilities
+            )
+
+        case .battery:
+            if let body = sections["Battery Power"], !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return SettingsLoad(
+                    settings: parseSettings(from: body),
+                    sourceDescription: "Battery Power (pmset -g custom)",
+                    warning: nil,
+                    capabilities: capabilities
+                )
+            }
+            let warning: String
+            if capabilities.known, capabilities.keys.isEmpty {
+                warning = "No Battery Power profile on this Mac (common on desktops). pmset -g cap lists no battery settings, so these controls are disabled."
+            } else {
+                warning = "No Battery Power section in pmset -g custom (common on desktops). Showing defaults — applying will write a battery profile if the Mac supports one."
+            }
+            return SettingsLoad(
+                settings: PowerSettings(),
+                sourceDescription: "defaults (no Battery Power profile)",
+                warning: warning,
+                capabilities: capabilities
+            )
+
+        case .all:
+            if let body = sections["AC Power"], !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                var warning: String?
+                if sections["Battery Power"] != nil {
+                    warning = "All applies the same values to AC and Battery. Form loaded from AC Power; switch to Battery only to edit that profile separately."
+                }
+                return SettingsLoad(
+                    settings: parseSettings(from: body),
+                    sourceDescription: "AC Power template for All (pmset -g custom)",
+                    warning: warning,
+                    capabilities: capabilities
+                )
+            }
+            return SettingsLoad(
+                settings: parseLiveSettings(),
+                sourceDescription: "Currently in use (pmset -g)",
+                warning: "No AC Power section in custom; loaded active values as the All template.",
+                capabilities: capabilities
+            )
+        }
+    }
+
+    /// Split `pmset -g custom` into section title → body (titles without trailing colon).
+    static func customSections(in text: String) -> [String: String] {
+        var sections: [String: String] = [:]
+        var currentTitle: String?
+        var currentLines: [String] = []
+
+        func flush() {
+            guard let title = currentTitle else { return }
+            sections[title] = currentLines.joined(separator: "\n")
+            currentLines = []
+        }
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine)
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            if trimmed.hasSuffix(":"),
+               !trimmed.hasPrefix("-"),
+               isCustomSectionHeader(trimmed)
+            {
+                flush()
+                currentTitle = String(trimmed.dropLast()).trimmingCharacters(in: .whitespaces)
+                continue
+            }
+
+            if currentTitle != nil {
+                currentLines.append(line)
+            }
+        }
+        flush()
+        return sections
+    }
+
+    private static func isCustomSectionHeader(_ trimmedLineEndingWithColon: String) -> Bool {
+        let withoutColon = trimmedLineEndingWithColon.dropLast()
+        let lower = withoutColon.lowercased()
+        if lower.contains("power") || lower.contains("battery") || lower.contains("ups") {
+            return true
+        }
+        if withoutColon.contains(where: { $0.isWhitespace }) {
+            return true
+        }
+        return false
+    }
+
     // MARK: - Argument builders
 
-    /// Builds argv for `pmset repeat <type> <weekdays> <HH:mm:ss>`.
     static func repeatArguments(type: EventType, weekdays: Set<Weekday>, time: Date) -> [String]? {
         let dayString = Weekday.allCases
             .filter { weekdays.contains($0) }
@@ -158,21 +400,30 @@ enum PmsetService {
         return ["repeat", type.rawValue, dayString, formatTime(time)]
     }
 
-    /// Builds argv for applying common timers/toggles under a power scope.
-    static func settingsArguments(_ settings: PowerSettings, scope: PowerScope) -> [String] {
+    /// Ordered (key, value) pairs for Settings apply / previews.
+    static func settingsKeyValuePairs(_ settings: PowerSettings) -> [(key: String, value: String)] {
         let s = settings.clamped()
         return [
-            scope.rawValue,
-            "displaysleep", String(s.displaysleep),
-            "sleep", String(s.sleep),
-            "disksleep", String(s.disksleep),
-            "womp", s.womp ? "1" : "0",
-            "powernap", s.powernap ? "1" : "0",
-            "autorestart", s.autorestart ? "1" : "0",
-            "ttyskeepawake", s.ttyskeepawake ? "1" : "0",
-            "proximitywake", s.proximitywake ? "1" : "0",
-            "tcpkeepalive", s.tcpkeepalive ? "1" : "0",
+            ("displaysleep", String(s.displaysleep)),
+            ("sleep", String(s.sleep)),
+            ("disksleep", String(s.disksleep)),
+            ("womp", s.womp ? "1" : "0"),
+            ("powernap", s.powernap ? "1" : "0"),
+            ("autorestart", s.autorestart ? "1" : "0"),
+            ("ttyskeepawake", s.ttyskeepawake ? "1" : "0"),
+            ("proximitywake", s.proximitywake ? "1" : "0"),
+            ("tcpkeepalive", s.tcpkeepalive ? "1" : "0"),
         ]
+    }
+
+    /// Builds argv for a full multi-key apply (preview). Actual apply uses per-key calls.
+    static func settingsArguments(_ settings: PowerSettings, scope: PowerScope) -> [String] {
+        var args = [scope.rawValue]
+        for pair in settingsKeyValuePairs(settings) {
+            args.append(pair.key)
+            args.append(pair.value)
+        }
+        return args
     }
 
     /// Human-readable command preview (with sudo for display only).
@@ -196,9 +447,66 @@ enum PmsetService {
         runPrivileged(arguments: ["repeat", "cancel"])
     }
 
-    /// Apply common timer / toggle settings under a power scope.
+    /// Apply timer/toggle settings under a power scope.
+    ///
+    /// Uses `pmset -g cap` to skip unsupported keys when known, then applies **one key at a time**
+    /// so a single rejection cannot abort the whole profile — and failed keys are named in the result.
     static func applySettings(_ settings: PowerSettings, scope: PowerScope) -> ActionResult {
-        runPrivileged(arguments: settingsArguments(settings, scope: scope))
+        let pairs = settingsKeyValuePairs(settings)
+        let capabilities = settingCapabilities(for: scope)
+
+        var applied: [String] = []
+        var skippedUnsupported: [String] = []
+        var failed: [(key: String, detail: String)] = []
+
+        for pair in pairs {
+            if !capabilities.allows(pair.key) {
+                skippedUnsupported.append(pair.key)
+                continue
+            }
+
+            switch runPrivileged(arguments: [scope.rawValue, pair.key, pair.value]) {
+            case .success:
+                applied.append(pair.key)
+            case .cancelled:
+                return .cancelled
+            case .failed(let message):
+                failed.append((pair.key, message))
+            }
+        }
+
+        if applied.isEmpty, failed.isEmpty, !skippedUnsupported.isEmpty {
+            return .failed(
+                "None of the Settings keys are reported as supported for \(scope.label) on this Mac (\(skippedUnsupported.joined(separator: ", ")))."
+            )
+        }
+
+        if applied.isEmpty, !failed.isEmpty {
+            let detail = failed.map { "\($0.key): \($0.detail)" }.joined(separator: "; ")
+            return .failed("No settings applied. \(detail)")
+        }
+
+        var parts: [String] = []
+        if !applied.isEmpty {
+            parts.append("Applied \(applied.joined(separator: ", ")).")
+        }
+        if !skippedUnsupported.isEmpty {
+            parts.append("Skipped (not in pmset -g cap for this Mac/scope): \(skippedUnsupported.joined(separator: ", ")).")
+        }
+        if !failed.isEmpty {
+            let detail = failed.map { "\($0.key) (\($0.detail))" }.joined(separator: "; ")
+            parts.append("Failed: \(detail).")
+        }
+
+        let message = parts.joined(separator: " ")
+        // Partial success is still success so the UI reloads and shows what stuck.
+        if !failed.isEmpty, !applied.isEmpty {
+            return .success(message)
+        }
+        if !failed.isEmpty {
+            return .failed(message)
+        }
+        return .success(message)
     }
 
     /// Immediate system sleep (unprivileged).
@@ -232,12 +540,12 @@ enum PmsetService {
     // MARK: - Process helpers
 
     /// Runs pmset as root and requires a successful shell exit (AEWP does not return exit codes).
+    /// Prefer calling after authorization has been obtained on the main thread.
     private static func runPrivileged(arguments: [String]) -> ActionResult {
         guard FileManager.default.isExecutableFile(atPath: pmsetPath) else {
             return .failed("Could not find \(pmsetPath).")
         }
 
-        // Escape every token for /bin/sh -c; never interpolate raw user strings unescaped.
         let quotedArgs = arguments.map(shellEscape).joined(separator: " ")
         let script = """
         \(shellEscape(pmsetPath)) \(quotedArgs)
@@ -246,14 +554,13 @@ enum PmsetService {
         switch PrivilegedSession.shared.runShell(script) {
         case .success(let output):
             let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            // pmset often prints nothing on success; treat clear failure text as errors.
             let lower = trimmed.lowercased()
             if lower.contains("error:")
                 || lower.contains("unhandled argument")
                 || lower.hasPrefix("usage:")
                 || lower.contains("\nusage:")
             {
-                return .failed(trimmed)
+                return .failed(trimmed.isEmpty ? "pmset rejected the request." : trimmed)
             }
             return .success(trimmed)
         case .cancelled:
@@ -294,7 +601,6 @@ enum PmsetService {
         }
     }
 
-    /// Exact key match: key must be followed by whitespace (avoids `autorestart` matching `autorestartatconnect`).
     private static func intValue(for key: String, in text: String) -> Int? {
         for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -302,7 +608,6 @@ enum PmsetService {
             let afterKey = trimmed.dropFirst(key.count)
             guard let first = afterKey.first, first.isWhitespace else { continue }
             let rest = afterKey.trimmingCharacters(in: .whitespaces)
-            // Value may be followed by parenthetical notes: "0 (sleep prevented by …)"
             let token = rest.prefix(while: { $0.isNumber || $0 == "-" || $0 == "+" })
             if let value = Int(token) {
                 return value
@@ -325,7 +630,6 @@ enum PmsetService {
         return formatter.string(from: date)
     }
 
-    /// Single-quote shell escape for privileged scripts.
     private static func shellEscape(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }

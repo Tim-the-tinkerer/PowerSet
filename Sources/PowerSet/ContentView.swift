@@ -24,17 +24,38 @@ struct ContentView: View {
     @State private var selectedDays: Set<PmsetService.Weekday> = [.sunday]
     @State private var eventTime: Date = Self.defaultEventTime()
     @State private var scheduleStatusText = ""
+    @State private var showTestingHelp = false
 
     // Settings
     @State private var powerScope: PmsetService.PowerScope = .all
     @State private var settings = PmsetService.PowerSettings()
+    @State private var settingsSourceDescription = ""
+    @State private var settingsLoadWarning: String?
+    /// False until `pmset -g cap` has been read. Unknown capabilities leave controls enabled.
+    @State private var capabilitiesKnown = false
+    @State private var supportedSettingKeys: Set<String> = []
+    @State private var settingsLoadGeneration: UInt64 = 0
+    @State private var statusRefreshGeneration: UInt64 = 0
 
     // Shared status line
     @State private var statusMessage: String?
     @State private var statusIsError = false
-    @State private var isBusy = false
+    /// Which in-flight job owns the busy flag. A newer job replaces the owner,
+    /// so a superseded refresh cannot leave the controls disabled.
+    @State private var busyKind: BusyKind = .idle
+
+    private enum BusyKind: Equatable {
+        case idle
+        case settingsLoad(UInt64)
+        case statusRefresh(UInt64)
+        case action
+    }
+
+    private var isBusy: Bool { busyKind != .idle }
     @State private var sessionAuthorized = false
     @State private var liveStatusText = ""
+
+    private let workQueue = DispatchQueue(label: "com.powerset.app.work", qos: .userInitiated)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -74,7 +95,7 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
         }
-        .frame(minWidth: 480, minHeight: 560)
+        .frame(minWidth: 480, minHeight: 520)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { refreshAll() }
         .onReceive(NotificationCenter.default.publisher(for: .powerSetAuthorizationDidChange)) { _ in
@@ -85,14 +106,19 @@ struct ContentView: View {
         }
         .onChange(of: tab) { newTab in
             if newTab == .status || newTab == .schedule {
-                refreshScheduleAndLive()
+                refreshScheduleAndLive(announce: false)
             }
+            if newTab == .settings {
+                reloadSettingsForCurrentScope(announce: false)
+            }
+        }
+        .onChange(of: powerScope) { _ in
+            reloadSettingsForCurrentScope(announce: true)
         }
     }
 
     // MARK: - Defaults
 
-    /// Today at 05:00 local — reliable for DatePicker + pmset time formatting.
     private static func defaultEventTime() -> Date {
         Calendar.current.date(bySettingHour: 5, minute: 0, second: 0, of: Date()) ?? Date()
     }
@@ -244,8 +270,7 @@ struct ContentView: View {
                                 .font(.subheadline.weight(.medium))
                             Spacer()
                             Button {
-                                refreshScheduleAndLive()
-                                setStatus("Schedule refreshed.", error: false)
+                                refreshScheduleAndLive(announce: true)
                             } label: {
                                 Image(systemName: "arrow.clockwise")
                             }
@@ -272,10 +297,8 @@ struct ContentView: View {
                         .font(.subheadline.weight(.semibold))
                 }
 
-                GroupBox {
+                DisclosureGroup(isExpanded: $showTestingHelp) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("How testing works")
-                            .font(.subheadline.weight(.medium))
                         Text(
                             """
                             Set Restart to a time a few minutes ahead, apply, and stay awake and logged in. When it fires, macOS shows its own restart notice — often with a “try again later” / postpone option of about 10 minutes. That dialog means the schedule worked.
@@ -301,11 +324,12 @@ struct ContentView: View {
                             .foregroundStyle(.tertiary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    .padding(4)
+                    .padding(.top, 6)
                 } label: {
                     Label("Testing & the restart dialog", systemImage: "questionmark.circle")
                         .font(.subheadline.weight(.semibold))
                 }
+                .padding(.horizontal, 4)
 
                 Text("Note: macOS allows one repeating power-on style event and one power-off style event. Applying a new schedule replaces the previous matching type.")
                     .font(.caption2)
@@ -371,43 +395,63 @@ struct ContentView: View {
                             .labelsHidden()
                             .frame(maxWidth: 220, alignment: .trailing)
                             .disabled(isBusy)
+                            .help("Loads and writes the matching pmset profile (custom AC / Battery, or -a for all).")
+                        }
+
+                        if !settingsSourceDescription.isEmpty {
+                            Text("Loaded from: \(settingsSourceDescription)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if let settingsLoadWarning {
+                            Text(settingsLoadWarning)
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if capabilitiesKnown {
+                            let unsupported = PmsetService.managedSettingKeys.filter { !supportedSettingKeys.contains($0) }
+                            if !unsupported.isEmpty {
+                                Text("Not supported on this Mac/scope (pmset -g cap): \(unsupported.joined(separator: ", "))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
 
                         timerRow(
                             title: "Display sleep",
+                            key: "displaysleep",
                             help: "Minutes until the display sleeps. 0 = never.",
                             value: $settings.displaysleep
                         )
                         timerRow(
                             title: "System sleep",
+                            key: "sleep",
                             help: "Minutes until the Mac sleeps. 0 = never.",
                             value: $settings.sleep
                         )
                         timerRow(
                             title: "Disk sleep",
+                            key: "disksleep",
                             help: "Minutes until disks spin down. 0 = never.",
                             value: $settings.disksleep
                         )
 
                         Divider()
 
-                        Toggle("Wake for network access (womp)", isOn: $settings.womp)
-                            .disabled(isBusy)
-                        Toggle("Power Nap", isOn: $settings.powernap)
-                            .disabled(isBusy)
-                        Toggle("Auto-restart after power loss", isOn: $settings.autorestart)
-                            .disabled(isBusy)
-                        Toggle("Keep awake for active TTYs", isOn: $settings.ttyskeepawake)
-                            .disabled(isBusy)
-                        Toggle("Proximity wake", isOn: $settings.proximitywake)
-                            .disabled(isBusy)
-                        Toggle("TCP keepalive during sleep", isOn: $settings.tcpkeepalive)
-                            .disabled(isBusy)
+                        settingToggle("Wake for network access (womp)", key: "womp", isOn: $settings.womp)
+                        settingToggle("Power Nap", key: "powernap", isOn: $settings.powernap)
+                        settingToggle("Auto-restart after power loss", key: "autorestart", isOn: $settings.autorestart)
+                        settingToggle("Keep awake for active TTYs", key: "ttyskeepawake", isOn: $settings.ttyskeepawake)
+                        settingToggle("Proximity wake", key: "proximitywake", isOn: $settings.proximitywake)
+                        settingToggle("TCP keepalive during sleep", key: "tcpkeepalive", isOn: $settings.tcpkeepalive)
 
                         Divider()
 
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Command preview")
+                            Text("Command preview (batch form)")
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(.secondary)
                             Text(settingsCommandPreview)
@@ -420,6 +464,9 @@ struct ContentView: View {
                                         .fill(Color(nsColor: .textBackgroundColor))
                                 )
                                 .accessibilityLabel("Command preview: \(settingsCommandPreview)")
+                            Text("Apply sends supported keys one at a time so rejections name the failing setting.")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
                         }
 
                         HStack(spacing: 10) {
@@ -431,16 +478,15 @@ struct ContentView: View {
                             .buttonStyle(.borderedProminent)
                             .tint(.orange)
                             .disabled(isBusy)
-                            .help("Applies the previewed pmset settings as administrator")
+                            .help("Applies supported settings for this scope as administrator")
 
                             Button {
-                                settings = PmsetService.parseLiveSettings()
-                                setStatus("Reloaded current settings from pmset -g.", error: false)
+                                reloadSettingsForCurrentScope(announce: true)
                             } label: {
                                 Label("Reload", systemImage: "arrow.clockwise")
                             }
                             .disabled(isBusy)
-                            .help("Re-read live values from pmset -g into the form")
+                            .help("Re-read the selected power profile and capabilities")
                         }
                     }
                     .padding(4)
@@ -452,7 +498,7 @@ struct ContentView: View {
                 GroupBox {
                     HStack(spacing: 10) {
                         Button {
-                            runQuick { PmsetService.displaySleepNow() }
+                            runUnprivilegedWork({ PmsetService.displaySleepNow() }, successFallback: "Display sleeping…")
                         } label: {
                             Label("Sleep Display Now", systemImage: "display")
                         }
@@ -460,7 +506,7 @@ struct ContentView: View {
                         .help("pmset displaysleepnow")
 
                         Button {
-                            runQuick { PmsetService.sleepNow() }
+                            runUnprivilegedWork({ PmsetService.sleepNow() }, successFallback: "Sleeping…")
                         } label: {
                             Label("Sleep Mac Now", systemImage: "moon.fill")
                         }
@@ -478,10 +524,26 @@ struct ContentView: View {
         }
     }
 
-    private func timerRow(title: String, help: String, value: Binding<Int>) -> some View {
-        HStack {
+    private func isSettingSupported(_ key: String) -> Bool {
+        // Unknown capabilities → leave all controls enabled.
+        // A known empty set (Battery on a desktop) disables every control.
+        !capabilitiesKnown || supportedSettingKeys.contains(key)
+    }
+
+    private func settingToggle(_ title: String, key: String, isOn: Binding<Bool>) -> some View {
+        let supported = isSettingSupported(key)
+        return Toggle(title, isOn: isOn)
+            .disabled(isBusy || !supported)
+            .help(supported ? title : "Not listed in pmset -g cap for this Mac/scope")
+            .opacity(supported ? 1 : 0.45)
+    }
+
+    private func timerRow(title: String, key: String, help: String, value: Binding<Int>) -> some View {
+        let supported = isSettingSupported(key)
+        return HStack {
             Text(title)
-                .help(help)
+                .help(supported ? help : "\(help) Not supported on this Mac/scope.")
+                .opacity(supported ? 1 : 0.45)
             Spacer()
             Stepper(value: value, in: 0...180, step: 1) {
                 Text(value.wrappedValue == 0 ? "Never" : "\(value.wrappedValue) min")
@@ -489,8 +551,8 @@ struct ContentView: View {
                     .frame(minWidth: 72, alignment: .trailing)
             }
             .frame(maxWidth: 200)
-            .disabled(isBusy)
-            .help(help)
+            .disabled(isBusy || !supported)
+            .help(supported ? help : "Not listed in pmset -g cap for this Mac/scope")
             .accessibilityLabel(title)
             .accessibilityValue(value.wrappedValue == 0 ? "Never" : "\(value.wrappedValue) minutes")
         }
@@ -514,8 +576,7 @@ struct ContentView: View {
                                 .font(.subheadline.weight(.medium))
                             Spacer()
                             Button {
-                                refreshScheduleAndLive()
-                                setStatus("Status refreshed.", error: false)
+                                refreshScheduleAndLive(announce: true)
                             } label: {
                                 Image(systemName: "arrow.clockwise")
                             }
@@ -535,7 +596,6 @@ struct ContentView: View {
                     }
                     .padding(4)
                 } label: {
-                    // SF Symbol available on macOS 13+ (avoid macOS 14-only gauge variants).
                     Label("pmset -g", systemImage: "gauge")
                         .font(.subheadline.weight(.semibold))
                 }
@@ -547,8 +607,7 @@ struct ContentView: View {
                                 .font(.subheadline.weight(.medium))
                             Spacer()
                             Button {
-                                refreshScheduleAndLive()
-                                setStatus("Status refreshed.", error: false)
+                                refreshScheduleAndLive(announce: true)
                             } label: {
                                 Image(systemName: "arrow.clockwise")
                             }
@@ -594,7 +653,7 @@ struct ContentView: View {
                 Text(statusMessage)
                     .font(.caption)
                     .foregroundStyle(statusIsError ? Color.primary : Color.secondary)
-                    .lineLimit(3)
+                    .lineLimit(4)
                     .textSelection(.enabled)
                     .accessibilityLabel(statusIsError ? "Error: \(statusMessage)" : statusMessage)
             } else {
@@ -607,7 +666,7 @@ struct ContentView: View {
         .frame(minHeight: 20)
     }
 
-    // MARK: - Actions
+    // MARK: - Actions (auth on main, pmset work off main)
 
     private func applyRepeat() {
         guard !isBusy else { return }
@@ -615,59 +674,90 @@ struct ContentView: View {
             setStatus("Select at least one weekday.", error: true)
             return
         }
-
-        isBusy = true
-        statusMessage = nil
         let type = eventType
         let days = selectedDays
         let time = eventTime
-
-        // Next run-loop turn so the busy state paints before the auth dialog.
-        DispatchQueue.main.async {
-            let result = PmsetService.applyRepeat(type: type, weekdays: days, time: time)
-            self.handle(result, successFallback: "Schedule applied.")
-            self.sessionAuthorized = PrivilegedSession.shared.isAuthorized
-            self.refreshScheduleAndLive()
-            self.isBusy = false
+        runPrivilegedWork(
+            { PmsetService.applyRepeat(type: type, weekdays: days, time: time) },
+            successFallback: "Schedule applied."
+        ) {
+            self.refreshScheduleAndLive(announce: false)
         }
     }
 
     private func cancelRepeat() {
         guard !isBusy else { return }
-        isBusy = true
-        statusMessage = nil
-        DispatchQueue.main.async {
-            let result = PmsetService.cancelRepeat()
-            self.handle(result, successFallback: "Repeating schedule cancelled.")
-            self.sessionAuthorized = PrivilegedSession.shared.isAuthorized
-            self.refreshScheduleAndLive()
-            self.isBusy = false
+        runPrivilegedWork(
+            { PmsetService.cancelRepeat() },
+            successFallback: "Repeating schedule cancelled."
+        ) {
+            self.refreshScheduleAndLive(announce: false)
         }
     }
 
     private func applySettings() {
         guard !isBusy else { return }
-        isBusy = true
-        statusMessage = nil
         let s = settings
         let scope = powerScope
-        DispatchQueue.main.async {
-            let result = PmsetService.applySettings(s, scope: scope)
-            self.handle(result, successFallback: "Power settings applied.")
-            self.sessionAuthorized = PrivilegedSession.shared.isAuthorized
-            self.refreshScheduleAndLive()
-            // Re-read live values so the form matches what the system accepted.
-            self.settings = PmsetService.parseLiveSettings()
-            self.isBusy = false
+        runPrivilegedWork(
+            { PmsetService.applySettings(s, scope: scope) },
+            successFallback: "Power settings applied to \(scope.label)."
+        ) {
+            self.refreshScheduleAndLive(announce: false)
+            self.reloadSettingsForCurrentScope(announce: false)
         }
     }
 
-    private func runQuick(_ action: @escaping () -> PmsetService.ActionResult) {
+    /// Password dialog on the main thread; `pmset` work on a background queue.
+    private func runPrivilegedWork(
+        _ work: @escaping () -> PmsetService.ActionResult,
+        successFallback: String,
+        then onComplete: (() -> Void)? = nil
+    ) {
         guard !isBusy else { return }
-        isBusy = true
+        busyKind = .action
+        statusMessage = nil
+
+        // Let the busy indicator paint, then authorize (UI must be main-thread).
         DispatchQueue.main.async {
-            self.handle(action(), successFallback: "Done.")
-            self.isBusy = false
+            switch PrivilegedSession.shared.ensureAuthorized() {
+            case .cancelled:
+                self.handle(.cancelled, successFallback: successFallback)
+                self.busyKind = .idle
+                return
+            case .failed(let message):
+                self.handle(.failed(message), successFallback: successFallback)
+                self.busyKind = .idle
+                return
+            case .success:
+                break
+            }
+
+            self.workQueue.async {
+                let result = work()
+                DispatchQueue.main.async {
+                    self.handle(result, successFallback: successFallback)
+                    self.sessionAuthorized = PrivilegedSession.shared.isAuthorized
+                    self.busyKind = .idle
+                    onComplete?()
+                }
+            }
+        }
+    }
+
+    private func runUnprivilegedWork(
+        _ work: @escaping () -> PmsetService.ActionResult,
+        successFallback: String
+    ) {
+        guard !isBusy else { return }
+        busyKind = .action
+        statusMessage = nil
+        workQueue.async {
+            let result = work()
+            DispatchQueue.main.async {
+                self.handle(result, successFallback: successFallback)
+                self.busyKind = .idle
+            }
         }
     }
 
@@ -675,7 +765,10 @@ struct ContentView: View {
         switch result {
         case .success(let output):
             let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            setStatus(trimmed.isEmpty ? successFallback : trimmed, error: false)
+            // Partial apply messages that include "Failed:" still succeed overall but surface as caution.
+            let caution = trimmed.localizedCaseInsensitiveContains("failed:")
+                || trimmed.localizedCaseInsensitiveContains("skipped")
+            setStatus(trimmed.isEmpty ? successFallback : trimmed, error: caution)
         case .cancelled:
             setStatus("Cancelled — no changes made.", error: true)
         case .failed(let message):
@@ -689,14 +782,71 @@ struct ContentView: View {
         statusIsError = error
     }
 
-    private func refreshAll() {
-        sessionAuthorized = PrivilegedSession.shared.isAuthorized
-        settings = PmsetService.parseLiveSettings()
-        refreshScheduleAndLive()
+    /// Load form fields from the profile that matches ``powerScope`` (off main thread).
+    private func reloadSettingsForCurrentScope(announce: Bool) {
+        settingsLoadGeneration &+= 1
+        let generation = settingsLoadGeneration
+        let scope = powerScope
+        if announce {
+            busyKind = .settingsLoad(generation)
+            statusMessage = nil
+        } else if case .settingsLoad = busyKind {
+            // This load replaces an announced one. That one will not clear the flag.
+            busyKind = .idle
+        }
+
+        workQueue.async {
+            let loaded = PmsetService.parseSettings(for: scope)
+            DispatchQueue.main.async {
+                guard generation == self.settingsLoadGeneration else { return }
+                self.settings = loaded.settings
+                self.settingsSourceDescription = loaded.sourceDescription
+                self.settingsLoadWarning = loaded.warning
+                self.supportedSettingKeys = loaded.capabilities.keys
+                self.capabilitiesKnown = loaded.capabilities.known
+                guard case .settingsLoad(let token) = self.busyKind, token == generation else { return }
+                if let warning = loaded.warning {
+                    self.setStatus(
+                        "Reloaded \(scope.label) from \(loaded.sourceDescription). \(warning)",
+                        error: true
+                    )
+                } else {
+                    self.setStatus(
+                        "Reloaded \(scope.label) from \(loaded.sourceDescription).",
+                        error: false
+                    )
+                }
+                self.busyKind = .idle
+            }
+        }
     }
 
-    private func refreshScheduleAndLive() {
-        scheduleStatusText = PmsetService.scheduleStatus()
-        liveStatusText = PmsetService.liveStatus()
+    private func refreshAll() {
+        sessionAuthorized = PrivilegedSession.shared.isAuthorized
+        reloadSettingsForCurrentScope(announce: false)
+        refreshScheduleAndLive(announce: false)
+    }
+
+    private func refreshScheduleAndLive(announce: Bool) {
+        statusRefreshGeneration &+= 1
+        let generation = statusRefreshGeneration
+        if announce {
+            busyKind = .statusRefresh(generation)
+        } else if case .statusRefresh = busyKind {
+            // This refresh replaces an announced one. That one will not clear the flag.
+            busyKind = .idle
+        }
+        workQueue.async {
+            let schedule = PmsetService.scheduleStatus()
+            let live = PmsetService.liveStatus()
+            DispatchQueue.main.async {
+                guard generation == self.statusRefreshGeneration else { return }
+                self.scheduleStatusText = schedule
+                self.liveStatusText = live
+                guard case .statusRefresh(let token) = self.busyKind, token == generation else { return }
+                self.setStatus("Status refreshed.", error: false)
+                self.busyKind = .idle
+            }
+        }
     }
 }

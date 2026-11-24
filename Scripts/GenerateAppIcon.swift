@@ -76,7 +76,6 @@ func renderIcon(size: Int) -> CGImage? {
 func drawBolt(in ctx: CGContext, size s: CGFloat, bounds: CGRect) {
     let cx = bounds.midX
     let cy = bounds.midY
-    let scale = s * 0.001
 
     // Classic lightning bolt polygon (normalized around center)
     let points: [(CGFloat, CGFloat)] = [
@@ -88,17 +87,19 @@ func drawBolt(in ctx: CGContext, size s: CGFloat, bounds: CGRect) {
         (-0.02, 0.02),
     ]
 
-    ctx.beginPath()
-    for (i, p) in points.enumerated() {
-        let x = cx + p.0 * s * 0.55
-        let y = cy + p.1 * s * 0.55
-        if i == 0 {
-            ctx.move(to: CGPoint(x: x, y: y))
-        } else {
-            ctx.addLine(to: CGPoint(x: x, y: y))
+    func addBoltPath() {
+        ctx.beginPath()
+        for (i, p) in points.enumerated() {
+            let x = cx + p.0 * s * 0.55
+            let y = cy + p.1 * s * 0.55
+            if i == 0 {
+                ctx.move(to: CGPoint(x: x, y: y))
+            } else {
+                ctx.addLine(to: CGPoint(x: x, y: y))
+            }
         }
+        ctx.closePath()
     }
-    ctx.closePath()
 
     // Soft shadow
     ctx.saveGState()
@@ -107,71 +108,88 @@ func drawBolt(in ctx: CGContext, size s: CGFloat, bounds: CGRect) {
         blur: s * 0.04,
         color: CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.35)
     )
+    addBoltPath()
     ctx.setFillColor(CGColor(srgbRed: 1, green: 0.98, blue: 0.92, alpha: 0.95))
     ctx.fillPath()
     ctx.restoreGState()
 
     // Re-path and fill (shadow path was consumed)
-    ctx.beginPath()
-    for (i, p) in points.enumerated() {
-        let x = cx + p.0 * s * 0.55
-        let y = cy + p.1 * s * 0.55
-        if i == 0 {
-            ctx.move(to: CGPoint(x: x, y: y))
-        } else {
-            ctx.addLine(to: CGPoint(x: x, y: y))
-        }
-    }
-    ctx.closePath()
+    addBoltPath()
     ctx.setFillColor(CGColor(srgbRed: 1, green: 0.98, blue: 0.92, alpha: 0.95))
     ctx.fillPath()
-
-    _ = scale
 }
 
 func writePNG(_ image: CGImage, to url: URL) throws {
-    let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
+    guard let dest = CGImageDestinationCreateWithURL(
+        url as CFURL,
+        UTType.png.identifier as CFString,
+        1,
+        nil
+    ) else {
+        throw NSError(
+            domain: "GenerateAppIcon",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Could not create PNG writer for \(url.lastPathComponent)"]
+        )
+    }
     CGImageDestinationAddImage(dest, image, nil)
     guard CGImageDestinationFinalize(dest) else {
-        throw NSError(domain: "GenerateAppIcon", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to write \(url.lastPathComponent)"])
+        throw NSError(
+            domain: "GenerateAppIcon",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Failed to write \(url.lastPathComponent)"]
+        )
     }
 }
 
-func writeICNS(images: [(Int, CGImage)], to url: URL) throws {
-    // Build iconset and run iconutil
-    let iconset = url.deletingLastPathComponent().appendingPathComponent("AppIcon.iconset")
-    try? FileManager.default.removeItem(at: iconset)
-    try FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
+/// Temporary names required by `iconutil` (must use Apple’s @2x convention).
+/// These exist only in a temp directory while building the .icns — never left in Assets.
+private let iconutilEntries: [(name: String, pixels: Int)] = [
+    ("icon_16x16.png", 16),
+    ("diana.k@example.org", 32),
+    ("icon_32x32.png", 32),
+    ("ivan.p@example.net", 64),
+    ("icon_128x128.png", 128),
+    ("wendy.h@example.net", 256),
+    ("icon_256x256.png", 256),
+    ("alice.j@example.com", 512),
+    ("icon_512x512.png", 512),
+    ("walt.e@example.net", 1024),
+]
 
-    let names: [Int: String] = [
-        16: "icon_16x16.png",
-        32: "diana.k@example.org",
-        64: "ivan.p@example.net",
-        128: "icon_128x128.png",
-        256: "wendy.h@example.net",
-        512: "icon_256x256.png",
-        1024: "icon_512x512.png",
-    ]
-    // Also standard 512@2x naming
-    let extra: [Int: String] = [
-        32: "icon_32x32.png",
-        256: "icon_256x256.png",
-        512: "icon_512x512.png",
-        1024: "walt.e@example.net",
-    ]
+/// Human-readable PNGs kept under Assets/AppIcon.iconset (no @ in the name).
+/// One file per pixel size — easy to browse; Finder won’t treat names as email addresses.
+private let archivePNGEntries: [(name: String, pixels: Int)] = [
+    ("icon_16x16.png", 16),
+    ("icon_32x32.png", 32),
+    ("icon_64x64.png", 64),
+    ("icon_128x128.png", 128),
+    ("icon_256x256.png", 256),
+    ("icon_512x512.png", 512),
+    ("icon_1024x1024.png", 1024),
+]
 
-    for (size, image) in images {
-        if let name = names[size] {
-            try writePNG(image, to: iconset.appendingPathComponent(name))
+func writeICNS(imagesByPixelSize: [Int: CGImage], to url: URL) throws {
+    // iconutil requires Apple’s exact @2x filenames — use a temp dir, then discard.
+    let tempIconset = FileManager.default.temporaryDirectory
+        .appendingPathComponent("PowerSet-AppIcon-\(UUID().uuidString).iconset")
+    try FileManager.default.createDirectory(at: tempIconset, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempIconset) }
+
+    for entry in iconutilEntries {
+        guard let image = imagesByPixelSize[entry.pixels] else {
+            throw NSError(
+                domain: "GenerateAppIcon",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Missing \(entry.pixels)px render for \(entry.name)"]
+            )
         }
-        if let name = extra[size] {
-            try writePNG(image, to: iconset.appendingPathComponent(name))
-        }
+        try writePNG(image, to: tempIconset.appendingPathComponent(entry.name))
     }
 
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
-    process.arguments = ["-c", "icns", iconset.path, "-o", url.path]
+    process.arguments = ["-c", "icns", tempIconset.path, "-o", url.path]
     try process.run()
     process.waitUntilExit()
     guard process.terminationStatus == 0 else {
@@ -179,23 +197,45 @@ func writeICNS(images: [(Int, CGImage)], to url: URL) throws {
     }
 }
 
+/// Writes only cleanly named size PNGs into Assets/AppIcon.iconset (no @2x names).
+func writeArchiveIconFolder(imagesByPixelSize: [Int: CGImage], to iconsetURL: URL) throws {
+    try? FileManager.default.removeItem(at: iconsetURL)
+    try FileManager.default.createDirectory(at: iconsetURL, withIntermediateDirectories: true)
+
+    for entry in archivePNGEntries {
+        guard let image = imagesByPixelSize[entry.pixels] else {
+            throw NSError(
+                domain: "GenerateAppIcon",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Missing \(entry.pixels)px render for \(entry.name)"]
+            )
+        }
+        try writePNG(image, to: iconsetURL.appendingPathComponent(entry.name))
+    }
+}
+
 let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let assets = root.appendingPathComponent("Assets")
 try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
 
-let sizes = [16, 32, 64, 128, 256, 512, 1024]
-var rendered: [(Int, CGImage)] = []
-for size in sizes {
+let pixelSizes = Array(Set(iconutilEntries.map(\.pixels))).sorted()
+var imagesByPixelSize: [Int: CGImage] = [:]
+for size in pixelSizes {
     guard let image = renderIcon(size: size) else {
         fputs("Failed to render \(size)px icon\n", stderr)
         exit(1)
     }
-    rendered.append((size, image))
+    imagesByPixelSize[size] = image
 }
 
-if let big = rendered.last?.1 {
+if let big = imagesByPixelSize[1024] {
     try writePNG(big, to: assets.appendingPathComponent("AppIcon-1024.png"))
 }
 
-try writeICNS(images: rendered, to: assets.appendingPathComponent("AppIcon.icns"))
-print("Wrote Assets/AppIcon.icns and AppIcon-1024.png")
+try writeICNS(imagesByPixelSize: imagesByPixelSize, to: assets.appendingPathComponent("AppIcon.icns"))
+try writeArchiveIconFolder(
+    imagesByPixelSize: imagesByPixelSize,
+    to: assets.appendingPathComponent("AppIcon.iconset")
+)
+print("Wrote Assets/AppIcon.icns, AppIcon-1024.png")
+print("Wrote Assets/AppIcon.iconset with clean names: \(archivePNGEntries.map(\.name).joined(separator: ", "))")

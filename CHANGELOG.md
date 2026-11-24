@@ -5,6 +5,59 @@ All notable changes to **PowerSet** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.5] - 2026-11-23
+
+### Fixed
+
+- Battery scope on a desktop no longer treats a missing Battery Power section in `pmset -g cap` as “unknown.” Those settings are dimmed and skipped instead of being offered for apply
+- Refresh and Reload clear the busy state when a newer read replaces them, so the controls cannot stay disabled
+- Window restoration opts into secure restorable state
+
+### Changed
+
+- Version **1.0.5** (build 6)
+
+## [1.0.4] - 2026-08-01
+
+### Fixed
+
+- Privileged and unprivileged `pmset` work runs on a background queue after main-thread authorization, so the UI no longer freezes while tools run (busy indicator is genuine)
+- Settings apply is capability-aware (`pmset -g cap`) and applies **one key at a time**, naming skipped unsupported keys and any rejections instead of aborting the whole profile on the first failure
+
+### Changed
+
+- Testing & restart-dialog copy is collapsed under a **DisclosureGroup** so the Schedule tab stays compact by default
+- Unsupported settings for the current Mac/scope are dimmed/disabled when capabilities are known
+- Version **1.0.4** (build 5)
+
+## [1.0.3] - 2026-08-01
+
+### Fixed
+
+- **Settings scope correctness:** form values load from the matching `pmset -g custom` section (AC Power / Battery Power) for the selected **Apply to** scope, not only from active `pmset -g`. Changing scope or **Reload** re-reads that profile; **Apply** reloads the same scope after write so AC values cannot silently overwrite Battery (and vice versa)
+- Desktops without a Battery Power section show defaults + a warning instead of pretending AC values are the battery profile
+
+### Changed
+
+- Settings UI shows **Loaded from:** … and an optional warning for the current profile source
+- Version **1.0.3** (build 4); README documents scope-aware settings and privileged-execution tradeoffs
+
+### Documentation
+
+- README: scope-aware load/save behavior for All / Battery / AC
+- README: architecture note on deprecated `AuthorizationExecuteWithPrivileges` (acceptable for local utilities; privileged helper recommended only if distributing broadly)
+
+## [1.0.2] - 2026-08-01
+
+### Fixed
+
+- App icon packaging: build `.icns` via a temporary folder using Apple’s required `@2x` names for `iconutil`, then keep only clean archive names in `Assets/AppIcon.iconset` (`icon_16x16.png` … `icon_1024x1024.png`, no `@` in filenames)
+- Icon pixel sizes match each file name (earlier dual maps had left wrong resolutions in some slots)
+
+### Changed
+
+- Version **1.0.2** (build 3)
+
 ## [1.0.1] - 2026-07-26
 
 ### Added
@@ -15,6 +68,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/).
 - Authorization-change notification so the **Admin ready** badge updates after **Forget Authorization**
 - Window menu (Close, Minimize, Bring All to Front)
 - Accessibility labels/values for weekdays, timers, previews, and status controls
+- `CHANGELOG.md` and `.gitignore`
 
 ### Fixed
 
